@@ -285,6 +285,7 @@ dependencies = [
  "core-foundation",
  "env_logger",
  "httparse",
+ "libc",
  "log",
  "mac_address",
  "objc2-io-kit",
