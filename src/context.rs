@@ -16,7 +16,7 @@ use std::{
     io,
 };
 
-use crate::timesync::timesync_listener;
+use crate::timesync::{timesync_listener, timesync_socket};
 use crate::virtio::{VirtioDeviceConfig, VsockAction, VsockConfig};
 use anyhow::{anyhow, Context};
 use env_logger::{Builder, Env, Target};
@@ -226,10 +226,7 @@ impl TryFrom<Args> for KrunContext {
         if let Some(timesync_port) = args.timesync {
             let vsock_config = VsockConfig {
                 port: timesync_port,
-                socket_url: PathBuf::from(format!(
-                    "/tmp/krunkit_timesync_{}.sock",
-                    std::process::id()
-                )),
+                socket_url: timesync_socket(),
                 action: VsockAction::Connect,
             };
             unsafe { vsock_config.krun_ctx_set(id)? }
@@ -250,7 +247,10 @@ impl KrunContext {
 
         // Only spawn a listener thread if the user specified unix:// or tcp://
         if uri.as_ref().is_some_and(|u| *u != RestfulUri::None) {
-            thread::spawn(move || status_listener(shutdown_eventfd, uri).unwrap());
+            let id = self.id;
+            // The guest's clock stops while the VM is paused.
+            let timesync = self.args.timesync.map(|_| timesync_socket());
+            thread::spawn(move || status_listener(id, timesync, shutdown_eventfd, uri).unwrap());
         }
 
         // If the user provides a pidfile path, wait until the last second before running the VM to
