@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.79"
+libc = "0.2"
 clap = { version = "4.5.0", features = ["derive"] }
 mac_address = "1.1.5"
 sysinfo = "0.31.4"
