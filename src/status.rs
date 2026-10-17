@@ -8,6 +8,7 @@ use std::{
         fd::{FromRawFd, RawFd},
         unix::net::UnixListener,
     },
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -17,6 +18,8 @@ use serde::{Deserialize, Serialize};
 #[link(name = "krun")]
 extern "C" {
     fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32;
+    fn krun_vm_pause(ctx_id: u32) -> i32;
+    fn krun_vm_resume(ctx_id: u32) -> i32;
 }
 
 const VM_STATE_PATH: &str = "/vm/state";
@@ -135,15 +138,26 @@ struct VmStateResponse {
 }
 
 impl VmStateResponse {
-    fn new(state: &str, can_stop: bool) -> Self {
+    fn new(state: &str, can_stop: bool, paused: bool) -> Self {
         Self {
             state: state.to_string(),
             can_start: false,
-            can_pause: false,
-            can_resume: false,
+            can_pause: can_stop && !paused,
+            can_resume: paused,
             can_stop,
             can_hard_stop: can_stop,
         }
+    }
+}
+
+/// The VM's state for a GET, and after a state change.
+fn current_state(stopping: bool, paused: bool) -> VmStateResponse {
+    if stopping {
+        VmStateResponse::new("VirtualMachineStateStopping", false, false)
+    } else if paused {
+        VmStateResponse::new("VirtualMachineStatePaused", true, true)
+    } else {
+        VmStateResponse::new("VirtualMachineStateRunning", true, false)
     }
 }
 
@@ -168,8 +182,11 @@ fn content_length(headers: &[httparse::Header]) -> usize {
 
 fn handle_incoming_stream<T: Read + Write>(
     stream: &mut T,
+    ctx_id: u32,
+    timesync: Option<&Path>,
     shutdown_fd: &mut File,
     stopping: &mut bool,
+    paused: &mut bool,
 ) {
     let mut buf = [0u8; 4096];
     let sz = match stream.read(&mut buf) {
@@ -218,12 +235,7 @@ fn handle_incoming_stream<T: Read + Write>(
 
     match method {
         "GET" => {
-            let (state, can_stop) = if *stopping {
-                ("VirtualMachineStateStopping", false)
-            } else {
-                ("VirtualMachineStateRunning", true)
-            };
-            let body = serde_json::to_string(&VmStateResponse::new(state, can_stop)).unwrap();
+            let body = serde_json::to_string(&current_state(*stopping, *paused)).unwrap();
             write_http_response(stream, 200, "OK", &body);
         }
         "POST" => {
@@ -245,13 +257,46 @@ fn handle_incoming_stream<T: Read + Write>(
             };
 
             match state_req.state.as_str() {
+                "Pause" | "Resume" if *stopping => {
+                    write_http_response(
+                        stream,
+                        409,
+                        "Conflict",
+                        "{\"error\":\"the VM is stopping\"}",
+                    );
+                }
+                request @ ("Pause" | "Resume") => {
+                    let pause = request == "Pause";
+                    // Both only queue the request; the vCPUs stop or go on
+                    // shortly after.
+                    let ret = unsafe {
+                        if pause {
+                            krun_vm_pause(ctx_id)
+                        } else {
+                            krun_vm_resume(ctx_id)
+                        }
+                    };
+                    if ret < 0 {
+                        let error = format!("{{\"error\":\"{request} failed: errno {}\"}}", -ret);
+                        write_http_response(stream, 409, "Conflict", &error);
+                        return;
+                    }
+                    *paused = pause;
+                    let body = serde_json::to_string(&current_state(false, pause)).unwrap();
+                    write_http_response(stream, 200, "OK", &body);
+                    // The guest's clock stood still while it was paused.
+                    if let (false, Some(socket)) = (pause, timesync) {
+                        crate::timesync::sync_time(socket.to_path_buf());
+                    }
+                }
                 "Stop" | "HardStop" => {
+                    // A paused guest can't see the shutdown request.
+                    if *paused {
+                        unsafe { krun_vm_resume(ctx_id) };
+                        *paused = false;
+                    }
                     *stopping = true;
-                    let body = serde_json::to_string(&VmStateResponse::new(
-                        "VirtualMachineStateStopping",
-                        false,
-                    ))
-                    .unwrap();
+                    let body = serde_json::to_string(&current_state(true, false)).unwrap();
                     write_http_response(stream, 200, "OK", &body);
                     if let Err(e) = shutdown_fd.write_all(&1u64.to_le_bytes()) {
                         log::error!("Failed to write to shutdown fd: {e}");
@@ -271,6 +316,8 @@ fn handle_incoming_stream<T: Read + Write>(
 
 /// Listen for status and shutdown requests from the client. Shut down the krun VM when prompted.
 pub fn status_listener(
+    ctx_id: u32,
+    timesync: Option<PathBuf>,
     shutdown_eventfd: RawFd,
     addr: Option<RestfulUri>,
 ) -> Result<(), anyhow::Error> {
@@ -280,6 +327,7 @@ pub fn status_listener(
     let addr = addr.unwrap_or_default();
 
     let mut stopping = false;
+    let mut paused = false;
 
     match addr {
         RestfulUri::Tcp(addr, port) => {
@@ -287,7 +335,14 @@ pub fn status_listener(
                 .map_err(|e| anyhow!("Unable to bind to TCP listener: {}", e))?;
 
             for stream in listener.incoming() {
-                handle_incoming_stream(&mut stream.unwrap(), &mut shutdown, &mut stopping)
+                handle_incoming_stream(
+                    &mut stream.unwrap(),
+                    ctx_id,
+                    timesync.as_deref(),
+                    &mut shutdown,
+                    &mut stopping,
+                    &mut paused,
+                )
             }
         }
         RestfulUri::Unix(path) => {
@@ -300,7 +355,14 @@ pub fn status_listener(
                 .map_err(|e| anyhow!("Unable to bind to unix socket: {}", e))?;
 
             for stream in listener.incoming() {
-                handle_incoming_stream(&mut stream.unwrap(), &mut shutdown, &mut stopping)
+                handle_incoming_stream(
+                    &mut stream.unwrap(),
+                    ctx_id,
+                    timesync.as_deref(),
+                    &mut shutdown,
+                    &mut stopping,
+                    &mut paused,
+                )
             }
         }
         RestfulUri::None => unreachable!(),
@@ -358,7 +420,8 @@ mod tests {
         let mut shutdown_fd =
             unsafe { File::from_raw_fd(std::os::fd::AsRawFd::as_raw_fd(&sock_a)) };
 
-        handle_incoming_stream(&mut stream, &mut shutdown_fd, stopping);
+        let mut paused = false;
+        handle_incoming_stream(&mut stream, u32::MAX, None, &mut shutdown_fd, stopping, &mut paused);
 
         std::mem::forget(shutdown_fd);
 
@@ -429,11 +492,32 @@ mod tests {
 
     #[test]
     fn post_invalid_state_returns_400() {
-        let req = make_request("POST", "/vm/state", Some("{\"state\":\"Pause\"}"));
+        let req = make_request("POST", "/vm/state", Some("{\"state\":\"Start\"}"));
         let mut stopping = false;
         let resp = handle_request(&req, &mut stopping);
         assert_eq!(response_status(&resp), 400);
         assert!(!stopping);
+    }
+
+    #[test]
+    fn pause_without_a_vm_returns_409() {
+        // No VM has ctx id u32::MAX: libkrun answers -ENOENT.
+        let req = make_request("POST", "/vm/state", Some("{\"state\":\"Pause\"}"));
+        let mut stopping = false;
+        let resp = handle_request(&req, &mut stopping);
+        assert_eq!(response_status(&resp), 409, "{resp}");
+        assert!(response_body(&resp).contains("errno"), "{resp}");
+    }
+
+    #[test]
+    fn paused_state_offers_resume() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&current_state(false, true)).unwrap())
+                .unwrap();
+        assert_eq!(json["state"], "VirtualMachineStatePaused");
+        assert_eq!(json["canPause"], false);
+        assert_eq!(json["canResume"], true);
+        assert_eq!(json["canStop"], true);
     }
 
     #[test]
@@ -485,13 +569,14 @@ mod tests {
 
     #[test]
     fn serialize_vm_state_response() {
-        let resp = VmStateResponse::new("VirtualMachineStateRunning", true);
+        let resp = VmStateResponse::new("VirtualMachineStateRunning", true, false);
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(json["state"], "VirtualMachineStateRunning");
         assert_eq!(json["canStop"], true);
         assert_eq!(json["canHardStop"], true);
-        assert_eq!(json["canPause"], false);
+        assert_eq!(json["canPause"], true);
+        assert_eq!(json["canResume"], false);
     }
 
     #[test]
