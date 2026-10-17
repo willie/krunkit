@@ -41,6 +41,20 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub gui: bool,
 
+    /// Unix socket of a process that shows the display and sends input
+    /// (see display_socket.rs). The display's size is the virtio-gpu device's.
+    #[arg(long = "display-socket")]
+    pub display_socket: Option<PathBuf>,
+
+    /// The display's pixel density, which the guest may use to pick a scale
+    /// (with --display-socket).
+    #[arg(long = "display-dpi")]
+    pub display_dpi: Option<u32>,
+
+    /// The display's refresh rate in Hz (with --display-socket).
+    #[arg(long = "display-refresh-rate")]
+    pub display_refresh_rate: Option<u32>,
+
     /// SMBIOS OEM String
     #[arg(long = "oem-string")]
     pub oem_strings: Option<Vec<String>>,

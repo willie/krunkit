@@ -4,6 +4,7 @@
 
 mod cmdline;
 mod context;
+mod display_socket;
 mod status;
 mod timesync;
 mod virtio;

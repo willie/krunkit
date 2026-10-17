@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::timesync::timesync_listener;
-use crate::virtio::{VsockAction, VsockConfig};
+use crate::virtio::{VirtioDeviceConfig, VsockAction, VsockConfig};
 use anyhow::{anyhow, Context};
 use env_logger::{Builder, Env, Target};
 
@@ -36,6 +36,14 @@ extern "C" {
 
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+// libkrun passes these to virglrenderer as they are. Venus runs in
+// virglrenderer's render server (a thread here) and signals fences through
+// the write_context_fence callback: without ASYNC_FENCE_CB there is no vrend
+// to poll on macOS and fences never retire. THREAD_SYNC goes with it;
+// virglrenderer drops it where there is no eventfd.
+const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
+const VIRGLRENDERER_ASYNC_FENCE_CB: u32 = 1 << 8;
+const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 
 /// The logging library will attempt to use escape sequences for things such as color if the target
 /// supports it. However, if the target does not support these escape sequences, the library will
@@ -171,13 +179,29 @@ impl TryFrom<Args> for KrunContext {
         }
 
         // Temporarily enable GPU by default
-        let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
+        let virgl_flags = VIRGLRENDERER_VENUS
+            | VIRGLRENDERER_NO_VIRGL
+            | VIRGLRENDERER_THREAD_SYNC
+            | VIRGLRENDERER_ASYNC_FENCE_CB
+            | VIRGLRENDERER_RENDER_SERVER;
         let sys = sysinfo::System::new_all();
         // Limit RAM + VRAM to 64 GB (36 bit IPA address limit) minus 2 GB (start address plus rounding).
         let rounded_mem = ((args.memory as u64) / 1024 + 1) * 1024;
         let vram = std::cmp::min((63488 - rounded_mem) * 1024 * 1024, sys.total_memory());
         if unsafe { krun_set_gpu_options2(id, virgl_flags, vram) } < 0 {
             return Err(anyhow!("unable to set krun vCPU/RAM configuration"));
+        }
+
+        if let Some(path) = &args.display_socket {
+            let (width, height) = args
+                .devices
+                .iter()
+                .find_map(|d| match d {
+                    VirtioDeviceConfig::Gpu(gpu) => Some((gpu.width, gpu.height)),
+                    _ => None,
+                })
+                .ok_or(anyhow!("--display-socket needs --device virtio-gpu,width=..,height=.."))?;
+            crate::display_socket::setup(id, path, width, height, args.display_dpi, args.display_refresh_rate)?;
         }
 
         // Configure each virtio device to include in the VM.
