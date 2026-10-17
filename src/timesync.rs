@@ -77,7 +77,7 @@ pub fn start_power_monitor() -> Receiver<Activity> {
     rx
 }
 
-fn sync_time(socket_url: PathBuf) {
+pub fn sync_time(socket_url: PathBuf) {
     let mut stream = match UnixStream::connect(&socket_url) {
         Ok(stream) => stream,
         Err(e) => {
@@ -89,6 +89,9 @@ fn sync_time(socket_url: PathBuf) {
             return;
         }
     };
+
+    // A guest that doesn't answer mustn't hold up the thread that asked.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
 
     let time_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -112,6 +115,11 @@ fn sync_time(socket_url: PathBuf) {
             log::error!("Failed to read qemu-guest-agent response: {e}");
         }
     }
+}
+
+/// The socket krunkit connects to the guest's time agent through.
+pub fn timesync_socket() -> PathBuf {
+    PathBuf::from(format!("/tmp/krunkit_timesync_{}.sock", std::process::id()))
 }
 
 pub fn timesync_listener(vsock_config: VsockConfig) {
