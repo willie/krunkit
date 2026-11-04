@@ -67,6 +67,11 @@ pub struct Args {
     #[arg(long, short)]
     pub nested: bool,
 
+    /// Exit with this code when the guest resets, so the caller can tell a reboot from a
+    /// power-off and start the VM again. Without it both end krunkit with exit code 0.
+    #[arg(long = "reset-exit-code")]
+    pub reset_exit_code: Option<u8>,
+
     /// Specify a pidfile path.
     #[arg(long)]
     pub pidfile: Option<PathBuf>,
